@@ -8,6 +8,7 @@ const puppeteer = require('puppeteer');
 const zlib = require('zlib');
 const fetch = require('node-fetch');
 const crc = require('crc');
+const genericPool = require("generic-pool");
 
 if (cluster.isMaster) 
 {
@@ -190,53 +191,69 @@ else
 	app.post('/', handleRequest);
 	app.get('/', handleRequest);
 
-	//We will have one browser instance per worker. Each request will create a new page
-	//puppeteer serialize all screen shots issued to the same browser.
-	//Also, node is single threaded (single thread process/worker), so a pool won't help (confirm?)
-	var globalBrowser = null;
-	async function getBrowser() 
-	{
-		//confirm browser doesn't accumulate unresponsive pages
-		if (globalBrowser != null) 
-		{
-			try 
-			{
-				var pages = await globalBrowser.pages();
-				
-				//Chrome always has 'chrome://welcome-win10/?text=faster' open [one page is always open]
-				if (pages.length > 1)
-				{
-					await globalBrowser.close();
-					globalBrowser = null;
-				}
-			}
-			catch (e)
-			{
-				await globalBrowser.close();
-				globalBrowser = null;
-			}
-		}
-		
-		if (globalBrowser == null)
-		{
-			globalBrowser = await puppeteer.launch({
-				headless: true,
-				args: ['--disable-gpu', '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+	//We will have one browser instance in each entry in the pool. Each request will create a new page
+	//puppeteer serialize all screen shots issued to the same browser. So, multiple pages per browser won't help
+	const poolFactory = {
+	  create: async function() 
+	  {
+		var browser = await puppeteer.launch({
+			headless: true,
+			args: ['--disable-gpu', '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
 
-			});
-			
-			// Listen for crashing browser
-			globalBrowser.on('disconnected', function () 
-			{
-				globalBrowser = null;
-			});
-		}
+		});
+		// Listen for crashing browser
+		browser.on('disconnected', function () 
+		{
+			browser.isDisconnected = true;
+		});
 		
-		return globalBrowser;
-	}
+		return browser;
+	  },
+	  destroy: async function(browser) 
+	  {
+		 await browser.close();
+	  },
+	  validate: async function(browser) 
+	  {
+		try 
+		{
+			if (browser.isDisconnected)
+			{
+				return false;
+			}
+			
+			var pages = await browser.pages();
+			
+			//Chrome always has 'chrome://welcome-win10/?text=faster' open [one page is always open]
+			if (pages.length > 1)
+			{
+				//destroy will call await browser.close();
+				return false;
+			}
+		}
+		catch (e)
+		{
+			//destroy will call await browser.close();
+			return false;
+		}
+		return true;
+	  }
+	};
 	
+	const browsersPool = genericPool.createPool(poolFactory, {
+		max: 2, // maximum size of the pool
+		min: 1, // minimum size of the pool
+		acquireTimeoutMillis: 30000, //maximum waiting time
+		testOnBorrow: true, //validate the browser before returning it
+		autostart: true //create the browsers on start
+		//TODO maybe we can evict browsers periodically to keep them fresh?
+		//evictionRunIntervalMillis: 
+		//idleTimeoutMillis:
+	});
+
 	async function handleRequest(req, res) 
 	{
+	  //console.log("Worker " + cluster.worker.id);
 	  try
 	  {
 		  //Merge all parameters into body such that get and post works the same	
@@ -255,21 +272,16 @@ else
 			var hp = req.body.h;
 			var h = (hp == null) ? 0 : parseInt(hp);
 
-			var page = null;
+			var page = null, browser = null, errorOccurred = false;
 			try
 			{
 				html = decodeURIComponent(
 							zlib.inflateRawSync(
 									new Buffer(decodeURIComponent(html), 'base64')).toString());
 				
-				const browser = await getBrowser();
+				browser = await browsersPool.acquire();
+
 				page = await browser.newPage();
-				
-				// Workaround for timeouts/zombies is to kill after 30 secs
-				setTimeout(async () => 
-				{
-					await page.close();
-				}, 30000);
 				
 				// https://github.com/GoogleChrome/puppeteer/issues/728
 				await page.goto(`data:text/html,${html}`, {waitUntil: 'networkidle0'});
@@ -287,18 +299,27 @@ else
 				res.header('Content-type', 'image/png');
 				  
 				res.end(data);
-
-				await page.close();
 			}
 			catch (e)
+			{
+				errorOccurred = true;
+				logger.info("Inflate failed for HTML input: " + html);
+				throw e;
+			}
+			finally
 			{
 				if (page != null)
 				{
 					await page.close();
 				}
 				
-				logger.info("Inflate failed for HTML input: " + html);
-				throw e;
+				if (browser != null) 
+				{
+					if (errorOccurred)
+						browsersPool.destroy(browser)
+					else
+						browsersPool.release(browser);
+				}
 			}
 		  }
 		  else
@@ -425,7 +446,7 @@ else
 			// Checks parameters
 			if (req.body.format && xml && req.body.w * req.body.h <= MAX_AREA)
 			{
-				var page = null;
+				var page = null, browser = null, errorOccurred = false;
 				try
 				{
 					var reqStr = ((xml != null) ? "xml=" + xml.length : "")
@@ -436,15 +457,10 @@ else
 
 					var t0 = Date.now();
 					
-					const browser = await getBrowser();
+					browser = await browsersPool.acquire();
+
 					page = await browser.newPage();
 
-					// Workaround for timeouts/zombies is to kill after 30 secs
-					setTimeout(async () => 
-					{
-						await page.close();
-					}, 30000);
-					
 					await page.goto('https://www.draw.io/export3.html', {waitUntil: 'networkidle0'});
 
 					const result = await page.evaluate((body) => {
@@ -570,15 +586,10 @@ else
 						res.status(400).end("Unsupported Format!");
 						logger.warn("Unsupported Format: " + req.body.format);
 					}
-
-					await page.close();
 				}
 				catch (e)
 				{
-					if (page != null)
-					{
-						await page.close();
-					}
+					errorOccurred = true;
 					
 					res.status(500).end("Error!");
 					
@@ -622,6 +633,20 @@ else
 					logger.warn("Handled exception: " + e.message
 							+ " req=" + reqStr, {stack: e.stack});
 					
+				}
+				finally
+				{
+					if (page != null)
+					{
+						await page.close();
+					}
+					if (browser != null) 
+					{
+						if (errorOccurred)
+							browsersPool.destroy(browser)
+						else
+							browsersPool.release(browser);
+					}
 				}
 			}
 			else
